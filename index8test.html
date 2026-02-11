@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>A-Frame Szene</title>
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+
+  <script src="https://unpkg.com/aframe-blink-controls/dist/aframe-blink-controls.min.js"></script>
+
+  <script>
+AFRAME.registerComponent('ground-follow', {
+  schema: {
+    ground: {type: 'string', default: '.ground'},
+    height: {type: 'number', default: 1.6},   // Augenhöhe über Boden
+    rayStart: {type: 'number', default: 50},  // Raycast Start über dir
+    smooth: {type: 'number', default: 0.35}   // 0..1 (mehr = schneller)
+  },
+  init() {
+    this.raycaster = new THREE.Raycaster();
+    this.down = new THREE.Vector3(0, -1, 0);
+    this.origin = new THREE.Vector3();
+    this.targets = [];
+    this._scan();
+  },
+  _scan() {
+    const els = Array.from(this.el.sceneEl.querySelectorAll(this.data.ground));
+    this.targets = els
+      .map(e => e.getObject3D('mesh'))
+      .filter(Boolean);
+  },
+  tick() {
+    if (!this.targets.length) this._scan();
+    if (!this.targets.length) return;
+
+    const p = this.el.object3D.position;
+    this.origin.set(p.x, p.y + this.data.rayStart, p.z);
+    this.raycaster.set(this.origin, this.down);
+
+    const hits = this.raycaster.intersectObjects(this.targets, true);
+    if (!hits.length) return;
+
+    const targetY = hits[0].point.y + this.data.height;
+    p.y = THREE.MathUtils.lerp(p.y, targetY, this.data.smooth);
+  }
+});
+
+AFRAME.registerComponent('simple-collision', {
+  schema: {
+    colliders: {type: 'string', default: '.solid'},
+    radius: {type: 'number', default: 0.35},
+    height: {type: 'number', default: 1.6}
+  },
+  init() {
+    this.lastSafe = new THREE.Vector3().copy(this.el.object3D.position);
+    this.tmp = new THREE.Vector3();
+    this.box = new THREE.Box3();
+    this.colliderMeshes = [];
+    this._scan();
+  },
+  _scan() {
+    const els = Array.from(this.el.sceneEl.querySelectorAll(this.data.colliders));
+    this.colliderMeshes = els
+      .map(e => e.getObject3D('mesh'))
+      .filter(Boolean);
+  },
+  tick() {
+    if (!this.colliderMeshes.length) this._scan();
+    const p = this.el.object3D.position;
+
+    // zwei "Körperpunkte" (Füße + Bauch), weil Rig-Y die Augenhöhe ist
+    const foot = this.tmp.set(p.x, p.y - this.data.height + this.data.radius, p.z).clone();
+    const mid  = this.tmp.set(p.x, p.y - this.data.height * 0.5, p.z).clone();
+
+    let hit = false;
+    for (const m of this.colliderMeshes) {
+      this.box.setFromObject(m).expandByScalar(this.data.radius);
+      if (this.box.containsPoint(foot) || this.box.containsPoint(mid)) { hit = true; break; }
+    }
+
+    if (hit) {
+      // nur X/Z zurücksetzen (Y macht ground-follow)
+      p.x = this.lastSafe.x;
+      p.z = this.lastSafe.z;
+    } else {
+      this.lastSafe.copy(p);
+    }
+  }
+});
+</script>
+
+
+<script>
+  AFRAME.registerComponent('camera-relative-wasd', {
+    schema: {
+      camera: { type: 'selector' },
+      speed: { type: 'number', default: 3.0 },   // m/s
+      sprint: { type: 'number', default: 6.0 }   // m/s (Shift)
+    },
+    init() {
+      this.keys = {};
+      this._onKeyDown = (e) => { this.keys[e.code] = true; };
+      this._onKeyUp = (e) => { this.keys[e.code] = false; };
+  
+      window.addEventListener('keydown', this._onKeyDown);
+      window.addEventListener('keyup', this._onKeyUp);
+  
+      this._fwd = new THREE.Vector3();
+      this._right = new THREE.Vector3();
+      this._move = new THREE.Vector3();
+      this._quat = new THREE.Quaternion();
+    },
+    remove() {
+      window.removeEventListener('keydown', this._onKeyDown);
+      window.removeEventListener('keyup', this._onKeyUp);
+    },
+    tick(t, dt) {
+      // In VR nicht per WASD bewegen (Quest hat eh keine Tastatur)
+      if (this.el.sceneEl && this.el.sceneEl.is('vr-mode')) return;
+  
+      const camEl = this.data.camera;
+      if (!camEl) return;
+  
+      const s = (this.keys['ShiftLeft'] || this.keys['ShiftRight']) ? this.data.sprint : this.data.speed;
+      const step = (dt / 1000) * s;
+  
+      // Input
+      const w = this.keys['KeyW'] || this.keys['ArrowUp'];
+      const sKey = this.keys['KeyS'] || this.keys['ArrowDown'];
+      const a = this.keys['KeyA'] || this.keys['ArrowLeft'];
+      const d = this.keys['KeyD'] || this.keys['ArrowRight'];
+  
+      if (!w && !sKey && !a && !d) return;
+  
+      // Vorwärtsvektor aus Kamera holen, aber nur auf XZ projizieren (Yaw)
+      camEl.object3D.getWorldQuaternion(this._quat);
+      this._fwd.set(0, 0, -1).applyQuaternion(this._quat);
+      this._fwd.y = 0;
+      this._fwd.normalize();
+  
+      // Rechts = Vorwärts x Up
+      this._right.copy(this._fwd).cross(new THREE.Vector3(0, 1, 0)).normalize();
+  
+      // Bewegungsvektor bauen
+      this._move.set(0, 0, 0);
+      if (w) this._move.add(this._fwd);
+      if (sKey) this._move.sub(this._fwd);
+      if (d) this._move.add(this._right);
+      if (a) this._move.sub(this._right);
+  
+      this._move.normalize().multiplyScalar(step);
+  
+      // Rig bewegen (nur X/Z – Y macht ground-follow)
+      const p = this.el.object3D.position;
+      p.x += this._move.x;
+      p.z += this._move.z;
+    }
+  });
+  </script>
+
+<script>
+  AFRAME.registerComponent('start-sound', {
+    init() {
+      const el = this.el;
+      const tryPlay = () => {
+        if (el.components.sound) el.components.sound.playSound();
+        window.removeEventListener('click', tryPlay);
+        window.removeEventListener('touchstart', tryPlay);
+        el.sceneEl.removeEventListener('enter-vr', tryPlay);
+      };
+      window.addEventListener('click', tryPlay);
+      window.addEventListener('touchstart', tryPlay, {passive: true});
+      el.sceneEl.addEventListener('enter-vr', tryPlay);
+    }
+  });
+  </script>
+  
+  
+
+</head>
+
+
+<body>
+  <a-scene
+  xr-mode-ui="enabled: true"
+  renderer="colorManagement: true; physicallyCorrectLights: true"
+  shadow="type: pcfsoft"
+  fog="type: linear; color: #cfd2ff; near: 6; far: 85">
+    
+    <a-assets>
+      <a-asset-item id="Boden"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/3.2_exam_3dscene_Boden_Simpel.glb"></a-asset-item>
+
+      <a-asset-item id="Steinring"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/3.2_exam_3dscene_Steinkreis_Simpel.glb"></a-asset-item>
+
+      <a-asset-item id="Steine"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/3.2_exam_3dscene_Steine_Simpel.glb"></a-asset-item>
+
+      <a-asset-item id="Pferd"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/3.2_exam_3dscene_Pferd_Simpel.glb"></a-asset-item>
+
+      <audio id="bgm" src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/SFX/Soundtrack_Olympus.mp3"
+       preload="auto" crossorigin="anonymous">
+      </audio>
+    </a-assets>
+  
+    <!-- Himmel -->
+    <a-sky src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/HDRI_4.jpg"></a-sky>
+
+
+     
+
+     <a-entity id="rig"
+     position="0 1.6 0"
+     rotation="0 0 0"
+     ground-follow="ground: .ground; height: 1.6"
+     camera-relative-wasd="camera: #cam; speed: 3; sprint: 6">
+   
+     <!-- Head bekommt look-controls, Kamera NICHT -->
+     <a-entity id="head" look-controls position="0 0 0">
+       <a-entity id="cam" camera position="0 0 0"></a-entity>
+     </a-entity>
+   
+     <a-entity
+       laser-controls="hand: left"
+       raycaster="objects: .teleport-surface; far: 30"
+       line="color: #ffffff; opacity: 0.8"
+       blink-controls="cameraRig: #rig; teleportOrigin: #cam; collisionEntities: .teleport-surface">
+     </a-entity>
+   
+     <a-entity
+       laser-controls="hand: right"
+       raycaster="objects: .teleport-surface; far: 30"
+       line="color: #ffffff; opacity: 0.8"
+       blink-controls="cameraRig: #rig; teleportOrigin: #cam; collisionEntities: .teleport-surface">
+     </a-entity>
+   </a-entity>
+   
+  
+    <a-entity light="type: ambient; intensity: 0.15"></a-entity>
+    <a-entity light="type: hemisphere; intensity: 0.45; color: #ffffff; groundColor: #3a3a3a"></a-entity>
+     <a-entity
+      position="6 12 6"
+      rotation="-55 45 0"
+     light="type: directional; intensity: 2.0; color: #DED4FA; castShadow: true;
+         shadowMapWidth: 2048; shadowMapHeight: 2048;
+         shadowCameraNear: 1; shadowCameraFar: 140;
+         shadowCameraLeft: -40; shadowCameraRight: 40;
+         shadowCameraTop: 40; shadowCameraBottom: -40;
+         shadowBias: -0.0005; shadowNormalBias: 0.04; shadowRadius:2">
+    </a-entity> 
+    <a-entity
+      light="type: directional; intensity: 0.35; color: #cfe6ff"
+      position="-6 6 20"
+      rotation="-25 -140 0">
+    </a-entity>
+
+    <a-entity
+      gltf-model="#Boden"
+      position="0 0 -3" 
+      shadow="cast: true; receive: true"
+      class="ground teleport-surface">
+    </a-entity>
+
+    <a-entity
+     gltf-model="#Steinring"
+      position="0 0 -3" 
+      shadow="cast: true; receive: true"
+      class="solid">
+   </a-entity>
+
+    <a-entity
+      gltf-model="#Pferd"
+      position="0 0 -3"
+     shadow="cast: true; receive: true"
+     class="solid"
+     sound="src: #bgm; autoplay: false; loop: true; volume: 0.8; positional: true;
+         refDistance: 3; rolloffFactor: 1; distanceModel: inverse; maxDistance: 60" start-sound>
+    </a-entity>
+
+    <a-entity
+    gltf-model="#Steine"
+    position="0 0 -3" 
+    shadow="cast: true; receive: true"
+    class="solid">
+    </a-entity>
+
+
+  </a-scene>
+
+</body>
+</html>
