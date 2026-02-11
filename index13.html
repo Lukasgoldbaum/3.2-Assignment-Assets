@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>A-Frame Szene</title>
+  <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+
+  <script src="https://unpkg.com/aframe-blink-controls/dist/aframe-blink-controls.min.js"></script>
+
+  <script>
+AFRAME.registerComponent('ground-follow', {
+  schema: {
+    ground: {type: 'string', default: '.ground'},
+    height: {type: 'number', default: 1.6},   // Augenhöhe über Boden
+    rayStart: {type: 'number', default: 50},  // Raycast Start über dir
+    smooth: {type: 'number', default: 0.35}   // 0..1 (mehr = schneller)
+  },
+  init() {
+    this.raycaster = new THREE.Raycaster();
+    this.down = new THREE.Vector3(0, -1, 0);
+    this.origin = new THREE.Vector3();
+    this.targets = [];
+    this._scan();
+  },
+  _scan() {
+    const els = Array.from(this.el.sceneEl.querySelectorAll(this.data.ground));
+    this.targets = els
+      .map(e => e.getObject3D('mesh'))
+      .filter(Boolean);
+  },
+  tick() {
+    if (!this.targets.length) this._scan();
+    if (!this.targets.length) return;
+
+    const p = this.el.object3D.position;
+    this.origin.set(p.x, p.y + this.data.rayStart, p.z);
+    this.raycaster.set(this.origin, this.down);
+
+    const hits = this.raycaster.intersectObjects(this.targets, true);
+    if (!hits.length) return;
+
+    const targetY = hits[0].point.y + this.data.height;
+    p.y = THREE.MathUtils.lerp(p.y, targetY, this.data.smooth);
+  }
+});
+
+AFRAME.registerComponent('simple-collision', {
+  schema: {
+    colliders: {type: 'string', default: '.solid'},
+    radius: {type: 'number', default: 0.35},
+    height: {type: 'number', default: 1.6}
+  },
+  init() {
+    this.lastSafe = new THREE.Vector3().copy(this.el.object3D.position);
+    this.tmp = new THREE.Vector3();
+    this.box = new THREE.Box3();
+    this.colliderMeshes = [];
+    this._scan();
+  },
+  _scan() {
+    const els = Array.from(this.el.sceneEl.querySelectorAll(this.data.colliders));
+    this.colliderMeshes = els
+      .map(e => e.getObject3D('mesh'))
+      .filter(Boolean);
+  },
+  tick() {
+    if (!this.colliderMeshes.length) this._scan();
+    const p = this.el.object3D.position;
+
+    // zwei "Körperpunkte" (Füße + Bauch), weil Rig-Y die Augenhöhe ist
+    const foot = this.tmp.set(p.x, p.y - this.data.height + this.data.radius, p.z).clone();
+    const mid  = this.tmp.set(p.x, p.y - this.data.height * 0.5, p.z).clone();
+
+    let hit = false;
+    for (const m of this.colliderMeshes) {
+      this.box.setFromObject(m).expandByScalar(this.data.radius);
+      if (this.box.containsPoint(foot) || this.box.containsPoint(mid)) { hit = true; break; }
+    }
+
+    if (hit) {
+      // nur X/Z zurücksetzen (Y macht ground-follow)
+      p.x = this.lastSafe.x;
+      p.z = this.lastSafe.z;
+    } else {
+      this.lastSafe.copy(p);
+    }
+  }
+});
+</script>
+
+
+<script>
+  AFRAME.registerComponent('camera-relative-wasd', {
+    schema: {
+      camera: { type: 'selector' },
+      speed: { type: 'number', default: 3.0 },   // m/s
+      sprint: { type: 'number', default: 6.0 }   // m/s (Shift)
+    },
+    init() {
+      this.keys = {};
+      this._onKeyDown = (e) => { this.keys[e.code] = true; };
+      this._onKeyUp = (e) => { this.keys[e.code] = false; };
+  
+      window.addEventListener('keydown', this._onKeyDown);
+      window.addEventListener('keyup', this._onKeyUp);
+  
+      this._fwd = new THREE.Vector3();
+      this._right = new THREE.Vector3();
+      this._move = new THREE.Vector3();
+      this._quat = new THREE.Quaternion();
+    },
+    remove() {
+      window.removeEventListener('keydown', this._onKeyDown);
+      window.removeEventListener('keyup', this._onKeyUp);
+    },
+    tick(t, dt) {
+      // In VR nicht per WASD bewegen (Quest hat eh keine Tastatur)
+      if (this.el.sceneEl && this.el.sceneEl.is('vr-mode')) return;
+  
+      const camEl = this.data.camera;
+      if (!camEl) return;
+  
+      const s = (this.keys['ShiftLeft'] || this.keys['ShiftRight']) ? this.data.sprint : this.data.speed;
+      const step = (dt / 1000) * s;
+  
+      // Input
+      const w = this.keys['KeyW'] || this.keys['ArrowUp'];
+      const sKey = this.keys['KeyS'] || this.keys['ArrowDown'];
+      const a = this.keys['KeyA'] || this.keys['ArrowLeft'];
+      const d = this.keys['KeyD'] || this.keys['ArrowRight'];
+  
+      if (!w && !sKey && !a && !d) return;
+  
+      // Vorwärtsvektor aus Kamera holen, aber nur auf XZ projizieren (Yaw)
+      camEl.object3D.getWorldQuaternion(this._quat);
+      this._fwd.set(0, 0, -1).applyQuaternion(this._quat);
+      this._fwd.y = 0;
+      this._fwd.normalize();
+  
+      // Rechts = Vorwärts x Up
+      this._right.copy(this._fwd).cross(new THREE.Vector3(0, 1, 0)).normalize();
+  
+      // Bewegungsvektor bauen
+      this._move.set(0, 0, 0);
+      if (w) this._move.add(this._fwd);
+      if (sKey) this._move.sub(this._fwd);
+      if (d) this._move.add(this._right);
+      if (a) this._move.sub(this._right);
+  
+      this._move.normalize().multiplyScalar(step);
+  
+      // Rig bewegen (nur X/Z – Y macht ground-follow)
+      const p = this.el.object3D.position;
+      p.x += this._move.x;
+      p.z += this._move.z;
+    }
+  });
+  </script>
+
+<script>
+  AFRAME.registerComponent('start-sound-on-vr', {
+    init() {
+      const el = this.el;
+      const scene = el.sceneEl;
+  
+      const play = async () => {
+        // AudioContext in VR oft "suspended" → erst resumieren
+        try {
+          const ctx = THREE.AudioContext.getContext();
+          if (ctx.state === 'suspended') await ctx.resume();
+        } catch (e) {}
+  
+        if (el.components.sound) el.components.sound.playSound();
+      };
+  
+      // Desktop
+      window.addEventListener('click', play, { once: true });
+      window.addEventListener('touchstart', play, { once: true, passive: true });
+  
+      // Quest / VR: erster Controller-Button
+      const bindControllerOnce = () => {
+        const ctrls = scene.querySelectorAll('[laser-controls],[hand-controls],[tracked-controls]');
+        const events = ['triggerdown','gripdown','abuttondown','bbuttondown','xbuttondown','ybuttondown','thumbstickdown'];
+        ctrls.forEach(c => events.forEach(ev => c.addEventListener(ev, play, { once: true })));
+      };
+  
+      scene.addEventListener('enter-vr', () => {
+        bindControllerOnce();
+        // optionaler Versuch nach kurzer Verzögerung (hilft manchmal schon)
+        setTimeout(play, 200);
+      });
+    }
+  });
+  </script>
+  
+  <script>
+    AFRAME.registerComponent('gem-game', {
+      schema: {
+        rig: { type: 'selector', default: '#rig' },
+        hud: { type: 'selector', default: '#hud' }
+      },
+    
+      init() {
+        this.collected = new Set(); // {1,2,3,4}
+        this.scene = this.el;
+    
+        this.scene.addEventListener('gem-collected', (e) => {
+          const id = e.detail.id;
+          this.collected.add(id);
+    
+          // HUD feedback
+          this._hud(`Gem ${id} collected (${this.collected.size}/4)`);
+    
+          // Wenn 1-3 komplett -> Gem4 freischalten
+          if (this._has123()) {
+            this.scene.emit('gems-123-complete');
+            this._hud('All 3 gems found! Gem 4 is now available.');
+          }
+    
+          // Wenn 4 auch gesammelt -> Finish
+          if (this._has123() && this.collected.has(4)) {
+            this.scene.emit('game-finished');
+            this._hud('✅ Completed!');
+          }
+        });
+      },
+    
+      isUnlocked(id) {
+        if (id === 4) return this._has123();
+        return true;
+      },
+    
+      _has123() {
+        return this.collected.has(1) && this.collected.has(2) && this.collected.has(3);
+      },
+    
+      _hud(msg) {
+        const hud = this.data.hud;
+        if (!hud) return;
+        hud.setAttribute('text', 'value', msg);
+        hud.setAttribute('visible', true);
+        clearTimeout(this._hudT);
+        this._hudT = setTimeout(() => hud.setAttribute('visible', false), 1800);
+      }
+    });
+    
+    
+    AFRAME.registerComponent('gem-hitbox', {
+      schema: {
+        id: { type: 'int' },                  // 1..4
+        model: { type: 'selector' },          // gem model entity
+        rig: { type: 'selector', default: '#rig' },
+        revealDistance: { type: 'number', default: 3.0 },
+        collectDistance: { type: 'number', default: 3.2 } // etwas großzügiger
+      },
+    
+      init() {
+        this.collected = false;
+        this.active = false;
+    
+        // Model beim Start verstecken
+        if (this.data.model) this.data.model.object3D.visible = false;
+    
+        // Für Desktop: Klick auf Hitbox einsammeln (optional)
+        this.el.addEventListener('click', () => this.tryCollect());
+      },
+    
+      tick() {
+        if (this.collected) return;
+    
+        const rig = this.data.rig;
+        if (!rig) return;
+    
+        const game = this.el.sceneEl.components['gem-game'];
+        if (!game) return;
+    
+        // Gem4 erst freischalten, wenn 1-3 collected
+        const unlocked = game.isUnlocked(this.data.id);
+    
+        const rigPos = rig.object3D.getWorldPosition(this._p1 || (this._p1 = new THREE.Vector3()));
+        const mePos  = this.el.object3D.getWorldPosition(this._p2 || (this._p2 = new THREE.Vector3()));
+        const d = rigPos.distanceTo(mePos);
+    
+        const shouldBeActive = unlocked && d <= this.data.revealDistance;
+    
+        if (shouldBeActive && !this.active) {
+          this.active = true;
+          if (this.data.model) this.data.model.object3D.visible = true;
+          game._hud(`Gem ${this.data.id}: press trigger to collect`);
+        }
+    
+        if (!shouldBeActive && this.active) {
+          this.active = false;
+          if (this.data.model) this.data.model.object3D.visible = false;
+        }
+      },
+    
+      tryCollect() {
+        if (this.collected) return;
+        if (!this.active) return;
+    
+        // Distanzcheck (damit man nicht aus 20m sammelt)
+        const rig = this.data.rig;
+        if (!rig) return;
+    
+        const rigPos = rig.object3D.getWorldPosition(this._p1 || (this._p1 = new THREE.Vector3()));
+        const mePos  = this.el.object3D.getWorldPosition(this._p2 || (this._p2 = new THREE.Vector3()));
+        const d = rigPos.distanceTo(mePos);
+        if (d > this.data.collectDistance) return;
+    
+        this.collected = true;
+    
+        // Model ausblenden (oder du kannst es auch "einsammeln animieren")
+        if (this.data.model) this.data.model.object3D.visible = false;
+    
+        // Hitbox weg, damit man nicht doppelt sammelt
+        this.el.object3D.visible = false;
+    
+        // Event ans Game
+        this.el.sceneEl.emit('gem-collected', { id: this.data.id });
+      }
+    });
+    
+    
+    AFRAME.registerComponent('gem-input', {
+      schema: {
+        left: { type: 'selector', default: '#handL' },
+        right:{ type: 'selector', default: '#handR' },
+        maxDistance: { type: 'number', default: 15 }
+      },
+    
+      init() {
+        this.raycaster = new THREE.Raycaster();
+        this.dir = new THREE.Vector3();
+        this.pos = new THREE.Vector3();
+        this.q = new THREE.Quaternion();
+    
+        const bind = (hand) => {
+          if (!hand) return;
+          // Trigger & Buttons abfangen (Quest)
+          ['triggerdown','gripdown','abuttondown','bbuttondown','xbuttondown','ybuttondown','thumbstickdown']
+            .forEach(ev => hand.addEventListener(ev, () => this._tryRayPick(hand)));
+        };
+    
+        // Desktop: Taste E sammelt "gem anvisiert" nicht, aber du kannst klicken (siehe cursor unten)
+        window.addEventListener('keydown', (e) => {
+          if (e.code === 'KeyE') {
+            // Versuch: rechter Hand (wenn vorhanden) sonst linker
+            this._tryRayPick(this.data.right || this.data.left);
+          }
+        });
+    
+        // Beim Laden/Enter-VR binden
+        setTimeout(() => { bind(this.data.left); bind(this.data.right); }, 500);
+        this.el.sceneEl.addEventListener('enter-vr', () => { bind(this.data.left); bind(this.data.right); });
+      },
+    
+      _tryRayPick(hand) {
+        if (!hand) return;
+    
+        // Ray von Controller nach vorne (-Z)
+        hand.object3D.getWorldPosition(this.pos);
+        hand.object3D.getWorldQuaternion(this.q);
+        this.dir.set(0,0,-1).applyQuaternion(this.q).normalize();
+    
+        this.raycaster.set(this.pos, this.dir);
+        this.raycaster.far = this.data.maxDistance;
+    
+        // alle Gem-Hitboxen raycasten
+        const hitEls = Array.from(this.el.sceneEl.querySelectorAll('.gem-hitbox'));
+        const hitMeshes = hitEls.map(e => e.getObject3D('mesh')).filter(Boolean);
+    
+        const hits = this.raycaster.intersectObjects(hitMeshes, true);
+        if (!hits.length) return;
+    
+        // Mesh -> Element zurückfinden
+        const hitObj = hits[0].object;
+        const el = hitEls.find(e => e.getObject3D('mesh') === hitObj || e.getObject3D('mesh')?.children?.includes(hitObj));
+        // fallback: hochlaufen bis entity gefunden
+        let targetEl = el || hits[0].object.el;
+        while (targetEl && !targetEl.components['gem-hitbox']) targetEl = targetEl.parentEl;
+    
+        if (targetEl && targetEl.components['gem-hitbox']) {
+          targetEl.components['gem-hitbox'].tryCollect();
+        }
+      }
+    });
+    </script>
+    
+    
+  
+  
+
+</head>
+
+
+<body>
+  <a-scene
+  xr-mode-ui="enabled: true"
+  renderer="colorManagement: true; physicallyCorrectLights: true"
+  shadow="type: pcfsoft"
+  fog="type: linear; color: #cfd2ff; near: 6; far: 85"
+  gem-game
+  gem-input>
+    
+    <a-assets>
+      <a-asset-item id="Boden"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/Simpletextured/3.2_exam_3dscene_Boden_simpletextured.glb"></a-asset-item>
+
+      <a-asset-item id="Steine"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/Simpletextured/3.2_exam_3dscene_Steine_simpletextured.glb"></a-asset-item>
+
+      <a-asset-item id="Pferd"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/Simpletextured/3.2_exam_3dscene_Pferd_simpletextured.glb"></a-asset-item>
+
+       <a-asset-item id="Tempel"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/Simpletextured/3.2_exam_3dscene_Tempel_simpletextured.glb"></a-asset-item>
+
+        <a-asset-item id="Gem1"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/Simpletextured/3.2_exam_3dscene_Gem1_simpletextured.glb"></a-asset-item>
+        <a-asset-item id="Gem2"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/Simpletextured/3.2_exam_3dscene_Gem2_simpletextured.glb"></a-asset-item>
+        <a-asset-item id="Gem3"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/Simpletextured/3.2_exam_3dscene_Gem3_simpletextured.glb"></a-asset-item>
+        <a-asset-item id="Gem4"
+        src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/Simpletextured/3.2_exam_3dscene_Gem4_simpletextured.glb"></a-asset-item>
+
+      <audio id="bgm" src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/SFX/Soundtrack_Olympus.mp3"
+       preload="auto" crossorigin="anonymous">
+      </audio>
+    </a-assets>
+  
+    <!-- Himmel -->
+    <a-sky src="https://lukasgoldbaum.github.io/3.2-Assignment-Assets/glb/HDRI_4.jpg"></a-sky>
+
+
+     
+
+     <a-entity id="rig"
+     position="0 1.6 0"
+     rotation="0 0 0"
+     ground-follow="ground: .ground; height: 1.6"
+     camera-relative-wasd="camera: #cam; speed: 3; sprint: 6">
+   
+     <!-- Head bekommt look-controls, Kamera NICHT -->
+     <a-entity id="head" look-controls position="0 0 0">
+       <a-entity id="cam" camera position="0 0 0"></a-entity>
+     </a-entity>
+   
+     <a-entity id="hud"
+      position="0 -0.25 -0.8"
+       visible="false"
+      text="value: ; align: center; width: 2; color: #FFFFFF">
+     </a-entity>
+
+
+     <a-entity
+        id="handL"
+       laser-controls="hand: left"
+       raycaster="objects: .teleport-surface; far: 30; interval: 60"
+       line="color: #ffffff; opacity: 0.8"
+       blink-controls="cameraRig: #rig; teleportOrigin: #cam; collisionEntities: .teleport-surface; curveNumberPoints: 20; interval: 60; drawIncrementally: false">
+     </a-entity>
+   
+     <a-entity
+        id="handR"
+       laser-controls="hand: right"
+       raycaster="objects: .teleport-surface; far: 30; interval: 60"
+       line="color: #ffffff; opacity: 0.8"
+       blink-controls="cameraRig: #rig; teleportOrigin: #cam; collisionEntities: .teleport-surface; curveNumberPoints: 20; interval: 60; drawIncrementally: false">
+     </a-entity>
+   </a-entity>
+   
+  
+    <a-entity light="type: ambient; intensity: 0.15"></a-entity>
+    <a-entity light="type: hemisphere; intensity: 0.45; color: #ffffff; groundColor: #3a3a3a"></a-entity>
+     <a-entity
+      position="6 12 6"
+      rotation="-55 45 0"
+     light="type: directional; intensity: 2.0; color: #DED4FA; castShadow: true;
+         shadowMapWidth: 2048; shadowMapHeight: 2048;
+         shadowCameraNear: 1; shadowCameraFar: 140;
+         shadowCameraLeft: -40; shadowCameraRight: 40;
+         shadowCameraTop: 40; shadowCameraBottom: -40;
+         shadowBias: -0.0005; shadowNormalBias: 0.04; shadowRadius:2">
+    </a-entity> 
+    <a-entity
+      light="type: directional; intensity: 0.35; color: #cfe6ff"
+      position="-6 6 20"
+      rotation="-25 -140 0">
+    </a-entity>
+
+    <a-entity
+      gltf-model="#Boden"
+      position="0 0 -3" 
+      shadow="cast: true; receive: true"
+      class="ground teleport-surface">
+    </a-entity>
+
+    <a-entity
+     gltf-model="#Tempel"
+      position="0 0 -3" 
+      shadow="cast: true; receive: true"
+      class="solid">
+   </a-entity>
+
+    <a-entity
+      gltf-model="#Pferd"
+      position="0 0 -3"
+     shadow="cast: true; receive: true"
+     class="solid">
+    </a-entity>
+
+    <a-entity
+    gltf-model="#Steine"
+    position="0 0 -3" 
+    shadow="cast: true; receive: true"
+    class="solid">
+    </a-entity>
+
+      <!-- GEM 1 -->
+    <a-entity id="gem1Model" gltf-model="#Gem1" position="2 0.5 -6" visible="false"></a-entity>
+    <a-sphere class="gem-hitbox"
+    position="2 0.5 -6"
+    radius="0.6"
+    material="opacity: 0; transparent: true"
+    gem-hitbox="id: 1; model: #gem1Model; revealDistance: 3.0">
+  </a-sphere>
+
+  <!-- GEM 2 -->
+  <a-entity id="gem2Model" gltf-model="#Gem2" position="-3 0.5 -10" visible="false"></a-entity>
+  <a-sphere class="gem-hitbox"
+    position="-3 0.5 -10"
+    radius="0.6"
+    material="opacity: 0; transparent: true"
+    gem-hitbox="id: 2; model: #gem2Model; revealDistance: 3.0">
+  </a-sphere>
+
+  <!-- GEM 3 -->
+  <a-entity id="gem3Model" gltf-model="#Gem3" position="5 0.5 -14" visible="false"></a-entity>
+  <a-sphere class="gem-hitbox"
+    position="5 0.5 -14"
+    radius="0.6"
+    material="opacity: 0; transparent: true"
+    gem-hitbox="id: 3; model: #gem3Model; revealDistance: 3.0">
+  </a-sphere>
+
+  <!-- GEM 4 (erscheint erst wenn 1-3 gesammelt sind) -->
+  <a-entity id="gem4Model" gltf-model="#Gem4" position="0 0.5 -3" visible="false"></a-entity>
+  <a-sphere class="gem-hitbox"
+    position="0 0.5 -3"
+    radius="0.7"
+    material="opacity: 0; transparent: true"
+    gem-hitbox="id: 4; model: #gem4Model; revealDistance: 3.0">
+  </a-sphere>
+
+
+    <a-entity id="musicSource"
+  position="0 1 -3"
+  sound="src: #bgm; autoplay: false; loop: true; volume: 0.8; positional: true;
+         refDistance: 3; rolloffFactor: 1; distanceModel: inverse; maxDistance: 60"
+  start-sound-on-vr>
+</a-entity>
+
+  </a-scene>
+
+</body>
+</html>
